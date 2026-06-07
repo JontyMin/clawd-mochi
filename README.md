@@ -40,13 +40,19 @@ Clawd Mochi sits on your desk and shows animated expressions on a small color di
 | ------------------- | -------------------------------- | ------ |
 | ESP32-C3 Super Mini | microcontroller with WiFi        | ~$2.50 |
 | ST7789 1.54" TFT    | 240×240 SPI color display        | ~$3.00 |
-| 8 short wires       | 8–10 cm Dupont / jumper wires    | ~$0.50 |
+| Passive piezo buzzer| 12mm, PWM driven                 | ~$0.30 |
+| TTP223 touch module | capacitive, single-pad           | ~$0.30 |
+| MPU6050 accelerometer | I2C, ~20×15×3mm                | ~$0.80 |
+| Aluminium foil tape | ~15×15mm patch inside case top   | ~$0.05 |
+| 12 short wires      | 8–10 cm Dupont / jumper wires    | ~$0.70 |
 | 2× M2×6mm screws    | to mount display bezel           | ~$0.10 |
 | Double-sided tape   | to secure components inside case | ~$0.10 |
 | USB-C cable         | for power                        | —      |
 | 3D printed case     | PLA or PETG, ~30g                | ~$0.50 |
 
-**Total: ~$7–8**
+**Total: ~$9–10**
+
+> The buzzer, TTP223 and MPU6050 are all optional. Without any of them you still get the standalone controller. Add them and Mochi gains: sound (buzzer), head-pat input (TTP223), and pickup/shake/desk-tap detection (MPU6050) — all of which the **Claude Code mirror** uses.
 
 ---
 
@@ -64,6 +70,25 @@ Clawd Mochi sits on your desk and shows animated expressions on a small color di
 | DC          | GPIO 1         | Blue                   |
 | CS          | GPIO 4         | White                  |
 | BL          | GPIO 3         | Yellow                 |
+
+### Optional add-ons — buzzer + touch + accelerometer
+
+| Module        | Pin   | ESP32-C3 GPIO | Notes                                |
+| ------------- | ----- | ------------- | ------------------------------------ |
+| Passive buzzer| `+`   | GPIO 5        | `−` to GND                           |
+| TTP223 touch  | VCC   | 3V3           |                                      |
+|               | GND   | GND           |                                      |
+|               | OUT   | GPIO 0        | active-HIGH (default jumpers)        |
+| MPU6050       | VCC   | 3V3           |                                      |
+|               | GND   | GND           |                                      |
+|               | SDA   | GPIO 20       | shared I2C bus (any other I2C parts on the same 2 pins) |
+|               | SCL   | GPIO 21       |                                      |
+
+> GPIO 20/21 are normally the C3's UART pins. They're free here because the README requires **USB CDC On Boot = Enabled**, which moves `Serial` onto the USB peripheral. Serial debugging still works.
+
+Glue the TTP223 module flat against the inside of the case top with double-sided tape, then stick a ~15×15mm aluminium foil patch on the inside surface above the module's sensing pad. Touch the outside of the case (pat Mochi on the head) to trigger.
+
+Glue the MPU6050 flat anywhere inside the case — orientation doesn't matter, the firmware just looks for spikes and shakes. Pickup, shake, and tabletop taps all work after install.
 
 ---
 
@@ -84,10 +109,13 @@ Download [Arduino IDE 2.x](https://www.arduino.cc/en/software) and install it.
 
 ### Step 3 — Install libraries
 
-Go to **Tools → Library Manager** and install both:
+Go to **Tools → Library Manager** and install:
 
 - `Adafruit GFX Library`
 - `Adafruit ST7735 and ST7789 Library`
+- `Adafruit MPU6050` (also pulls `Adafruit Unified Sensor` and `Adafruit BusIO` as dependencies — accept when prompted)
+
+The MPU6050 library compiles into the firmware even if you don't install the chip — the firmware skips it gracefully when no module responds on I2C.
 
 ### Step 4 — Configure board settings
 
@@ -113,15 +141,21 @@ Go to **Tools** and set:
 
 ## How to use it
 
-### Connect and open the controller
+### First-time WiFi setup
 
-1. Power the ESP32 via USB-C (any USB charger or power bank)
-2. Wait ~3 seconds for the boot animation to finish
-3. On your phone or computer, go to **WiFi settings**
-4. Connect to the network: **`ClaWD-Mochi`** · password: **`clawd1234`**
-5. Open a browser and go to **`http://192.168.4.1`**
+On first power-up Mochi has no saved network and opens a setup hotspot.
 
-You should see the web controller:
+1. Power the ESP32 via USB-C
+2. Wait for the boot logo, then "SETUP MODE" with the hotspot details
+3. On your phone, join **`ClaWD-Mochi`** (password: **`clawd1234`**)
+4. Open **`http://192.168.4.1`** in a browser
+5. Enter your home WiFi SSID and password → "SAVE & REBOOT"
+
+After reboot, Mochi connects to your home WiFi and the display shows its **new IP address**. From then on, just open that IP in a browser to use the controller — no hotspot, no app.
+
+If Mochi can't reach the saved network (you moved, changed router), it automatically falls back to setup mode so you can re-provision.
+
+### The controller
 
 <img src="pics/clawd_mochi_webpage.jpeg" alt="Webpage view" width="500"/>
 
@@ -137,7 +171,47 @@ You should see the web controller:
 | Background color   | Changes background color of all views           |
 | Pen color          | Sets drawing color for canvas                   |
 | Display on/off     | Toggles the backlight                           |
+| Sound on/off       | Toggles the passive buzzer                      |
 | ✓ done (in canvas) | Exits canvas mode                               |
+
+---
+
+## Connect to Claude Code
+
+This is the main reason to add the buzzer + TTP223. Mochi can mirror your real Claude Code session:
+
+- Claude is thinking → squish eyes pulse
+- Claude calls a tool (`Bash`, `Edit`, etc.) → tool name on screen + buzzer tick
+- Claude requests permission → flashing frame + alert tone; **pat Mochi on the head** to confirm, or hold the touch to dismiss
+- Claude finishes → satisfied eyes + chime; you can walk away and come back when Mochi calls
+
+It's a one-time install:
+
+```bash
+git clone <this repo>
+cd clawd-mochi
+bash bridge/install.sh        # asks for Mochi's IP, registers Claude Code hooks
+```
+
+Restart Claude Code and Mochi will react to your next session.
+
+### Permission loop — pat Mochi to approve
+
+When Claude wants to run a **dangerous tool** (`Bash`, `Edit`, `Write`, `MultiEdit`, `NotebookEdit`) it's gated by a `PreToolUse` hook that asks Mochi instead of the terminal:
+
+- **Pat Mochi's head** (TTP223 short tap) **or tap the desk** (MPU6050) → **allow**
+- **Hold the touch** for >800ms → **deny**
+- **Double tap** or wait 15s → falls through to Claude's normal terminal y/n prompt (escape hatch)
+
+Other tools (`Read`, `Glob`, `Grep`, etc.) pass through silently — no gating, no buzzer. Tune via `bridge/config.json` (`permission_loop_enabled`, `permission_timeout_s`).
+
+### Multiple Claude Code sessions
+
+If you run two Claude Code terminals at the same time, Mochi mirrors **whichever session most recently submitted a prompt**. So if you switch terminals and hit enter, that session "takes over" the display. Sessions you ignore stop showing on Mochi until you go back and submit again.
+
+(Per-window focus tracking like the desktop variant would need macOS Accessibility APIs; the bridge keeps the dependency story zero — "last prompt wins" covers the common case.)
+
+See [bridge/README.md](bridge/README.md) for full install / config / uninstall details.
 
 ---
 

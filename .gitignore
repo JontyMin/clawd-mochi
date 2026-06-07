@@ -23,3 +23,6 @@ desktop.ini
 *.log
 *.tmp
 *.bak
+
+# Bridge — local install config
+bridge/config.json

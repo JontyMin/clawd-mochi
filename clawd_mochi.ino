@@ -22,6 +22,10 @@
 #include <math.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <Preferences.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 
 // ── Pins ──────────────────────────────────────────────────────
 #define TFT_CS  4
@@ -29,12 +33,32 @@
 #define TFT_RST 2
 #define TFT_BLK 3
 
+#define BUZZER_PIN 5   // passive piezo buzzer (PWM via tone()/LEDC)
+#define TOUCH_PIN  0   // TTP223 OUT (active-HIGH by default — touch through case)
+#define BOOT_PIN   9   // on-board BOOT button (active-LOW) — dev fallback ack
+#define I2C_SDA   20   // freed because USB CDC On Boot means Serial uses USB
+#define I2C_SCL   21
+
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 
 // ── WiFi ──────────────────────────────────────────────────────
 const char* AP_SSID = "ClaWD-Mochi";
 const char* AP_PASS = "clawd1234";
 WebServer server(80);
+
+// Provisioning / runtime mode
+bool       apMode      = false;   // true while soft-AP provisioning
+String     staSsid     = "";      // loaded from NVS on boot
+String     staPass     = "";
+String     staIpStr    = "";      // human-readable when STA connected
+Preferences prefs;
+
+// MPU6050 (optional accelerometer)
+Adafruit_MPU6050 mpu;
+bool          mpuPresent     = false;
+unsigned long lastMpuReadMs  = 0;
+unsigned long lastGestureMs  = 0;
+String        lastGesture    = "none";   // "tap", "shake", "none"
 
 // ── Display ───────────────────────────────────────────────────
 #define DISP_W 240
@@ -57,14 +81,36 @@ uint16_t C_ORANGE, C_DARKBG, C_MUTED, C_GREEN;
 #define VIEW_EYES_SQUISH 1
 #define VIEW_CODE        2
 #define VIEW_DRAW        3
+#define VIEW_WORKING     4
+#define VIEW_PERMISSION  5
+#define VIEW_ERROR       6
 
 uint8_t  currentView  = VIEW_EYES_NORMAL;
 bool     busy         = false;
 bool     backlightOn  = true;
 uint8_t  animSpeed    = 1;   // 1=slow(default) 2=normal 3=fast
 
+// ── Claude Code session state machine (high-level) ────────────
+// Mapped from Mac-side Claude Code hooks via /event endpoint.
+enum SessionState {
+  SS_IDLE,        // no session active or quiet
+  SS_THINKING,    // UserPromptSubmit → model thinking
+  SS_WORKING,     // PreToolUse → tool executing
+  SS_PERMISSION,  // Notification → permission request pending
+  SS_DONE,        // Stop → finished, returns to idle after a beat
+  SS_ERROR        // tool / model error
+};
+SessionState sessionState   = SS_IDLE;
+String       sessionMeta    = "";   // tool name, permission desc, etc.
+bool         autoMode       = true; // /event drives display when true
+unsigned long lastSessionEventMs = 0;
+unsigned long sessionAnimNextMs   = 0;   // next tick for breathing animations
+uint8_t       sessionAnimPhase    = 0;   // 0/1 toggle for pulse
+
 uint16_t animBgColor  = 0;   // background for eye/logo animations
 uint16_t drawBgColor  = 0;   // background for canvas
+
+bool     buzzerMuted  = false;
 
 // ── Terminal ──────────────────────────────────────────────────
 #define TERM_COLS      15
@@ -206,6 +252,219 @@ uint16_t hexToRgb565(String hex) {
 void setBacklight(bool on) {
   backlightOn = on;
   digitalWrite(TFT_BLK, on ? HIGH : LOW);
+}
+
+// ── Buzzer ────────────────────────────────────────────────────
+// All events Phase A–D may emit. tone() on ESP32 is non-blocking
+// (LEDC-backed); multi-note sequences use short blocking delays.
+enum BeepEvent {
+  BEEP_BOOT,        // ascending 3-note chord at boot
+  BEEP_VIEW,        // single short blip on view switch
+  BEEP_TYPE,        // tiny click per terminal char
+  BEEP_THINK,       // low pulse while Claude is thinking
+  BEEP_TOOL,        // soft tick on tool invocation
+  BEEP_PERMISSION,  // distinctive 2-tone alert
+  BEEP_DONE,        // satisfied 2-note up
+  BEEP_ERROR,       // low growl
+  BEEP_TOUCH_OK,    // touch short-press confirm
+  BEEP_TOUCH_DENY   // touch long-press reject
+};
+
+void beep(BeepEvent e) {
+  if (buzzerMuted) return;
+  switch (e) {
+    case BEEP_BOOT:
+      tone(BUZZER_PIN, 660,  60); delay(70);
+      tone(BUZZER_PIN, 880,  60); delay(70);
+      tone(BUZZER_PIN, 1175, 90); break;
+    case BEEP_VIEW:       tone(BUZZER_PIN, 1200, 35); break;
+    case BEEP_TYPE:       tone(BUZZER_PIN, 2400,  8); break;
+    case BEEP_THINK:      tone(BUZZER_PIN, 600,  60); break;
+    case BEEP_TOOL:       tone(BUZZER_PIN, 1500, 30); break;
+    case BEEP_PERMISSION:
+      tone(BUZZER_PIN, 880, 80);  delay(100);
+      tone(BUZZER_PIN, 880, 80);  break;
+    case BEEP_DONE:
+      tone(BUZZER_PIN, 880,  60); delay(70);
+      tone(BUZZER_PIN, 1318, 100); break;
+    case BEEP_ERROR:
+      tone(BUZZER_PIN, 250, 150); delay(170);
+      tone(BUZZER_PIN, 180, 200); break;
+    case BEEP_TOUCH_OK:   tone(BUZZER_PIN, 1800, 30); break;
+    case BEEP_TOUCH_DENY: tone(BUZZER_PIN, 400,  80); break;
+  }
+}
+
+// ── NVS config (WiFi credentials) ──────────────────────────────
+void cfgLoad() {
+  prefs.begin("clawd", true);
+  staSsid = prefs.getString("ssid", "");
+  staPass = prefs.getString("pass", "");
+  prefs.end();
+}
+
+void cfgSave(const String& ssid, const String& pass) {
+  prefs.begin("clawd", false);
+  prefs.putString("ssid", ssid);
+  prefs.putString("pass", pass);
+  prefs.end();
+}
+
+void cfgClear() {
+  prefs.begin("clawd", false);
+  prefs.clear();
+  prefs.end();
+}
+
+// ── Touch input (TTP223 capacitive) ────────────────────────────
+// Short tap (<800ms) = OK / confirm permission
+// Long press (>=800ms) = deny permission / toggle buzzer mute
+// Double tap (two releases <400ms apart) = force SS_IDLE
+
+// Forward decl — defined in SESSION VIEWS section below.
+void setSessionState(SessionState s, const String& meta = "");
+
+#define TOUCH_DEBOUNCE_MS 25
+#define TOUCH_LONG_MS    800
+#define TOUCH_DOUBLE_MS  400
+
+enum TouchPhase { TP_IDLE, TP_PRESSED, TP_RELEASED_WAITING };
+TouchPhase    touchPhase        = TP_IDLE;
+bool          touchPrev         = false;
+unsigned long touchDebounceMs   = 0;
+unsigned long touchPressedAt    = 0;
+unsigned long touchReleasedAt   = 0;
+String        touchLastEvent    = "none";
+unsigned long touchLastEventMs  = 0;     // millis() stamp — bridge polls for changes
+
+// BOOT key (GPIO 9, active LOW with internal pull-up)
+bool          bootPrev          = true;  // pulled HIGH at idle
+unsigned long bootDebounceMs    = 0;
+
+void handleTouchShort() {
+  touchLastEvent   = "short";
+  touchLastEventMs = millis();
+  if (sessionState == SS_PERMISSION) {
+    // Bridge sees the touchTs change and writes back a permissionDecision.
+    setSessionState(SS_THINKING, sessionMeta);
+  }
+  beep(BEEP_TOUCH_OK);
+}
+
+void handleTouchLong() {
+  touchLastEvent   = "long";
+  touchLastEventMs = millis();
+  if (sessionState == SS_PERMISSION) {
+    setSessionState(SS_IDLE);
+    beep(BEEP_TOUCH_DENY);
+  } else {
+    buzzerMuted = !buzzerMuted;
+    if (!buzzerMuted) beep(BEEP_TOUCH_OK);
+  }
+}
+
+void handleTouchDouble() {
+  touchLastEvent   = "double";
+  touchLastEventMs = millis();
+  setSessionState(SS_IDLE);
+  beep(BEEP_TOUCH_OK);
+}
+
+void tickTouch() {
+  unsigned long now = millis();
+  bool raw = digitalRead(TOUCH_PIN);   // HIGH while finger present
+
+  if (raw != touchPrev) {
+    if (now - touchDebounceMs > TOUCH_DEBOUNCE_MS) {
+      touchPrev       = raw;
+      touchDebounceMs = now;
+
+      if (raw) {  // press edge
+        if (touchPhase == TP_RELEASED_WAITING &&
+            now - touchReleasedAt < TOUCH_DOUBLE_MS) {
+          handleTouchDouble();
+          touchPhase = TP_IDLE;
+        } else {
+          touchPressedAt = now;
+          touchPhase     = TP_PRESSED;
+        }
+      } else {    // release edge
+        unsigned long held = now - touchPressedAt;
+        if (held >= TOUCH_LONG_MS) {
+          handleTouchLong();
+          touchPhase = TP_IDLE;
+        } else {
+          touchReleasedAt = now;
+          touchPhase      = TP_RELEASED_WAITING;
+        }
+      }
+    }
+  }
+
+  // Resolve a pending short tap once the double-tap window expires
+  if (touchPhase == TP_RELEASED_WAITING &&
+      now - touchReleasedAt > TOUCH_DOUBLE_MS) {
+    handleTouchShort();
+    touchPhase = TP_IDLE;
+  }
+}
+
+// ── BOOT key (GPIO 9, dev fallback) ────────────────────────────
+// Sealed cases hide this — useful only with case open / during bring-up.
+void tickBoot() {
+  unsigned long now = millis();
+  bool raw = digitalRead(BOOT_PIN);   // LOW while pressed
+  if (raw != bootPrev) {
+    if (now - bootDebounceMs > 30) {
+      bootPrev       = raw;
+      bootDebounceMs = now;
+      if (raw == LOW) handleTouchShort();   // press edge → same as tap
+    }
+  }
+}
+
+// ── MPU6050 gestures (tap + shake) ─────────────────────────────
+// Sampled at 20Hz. Thresholds are starting points; tune on device.
+void tickMpu() {
+  if (!mpuPresent) return;
+  unsigned long now = millis();
+  if (now - lastMpuReadMs < 50) return;
+  lastMpuReadMs = now;
+
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  const float ax = a.acceleration.x;
+  const float ay = a.acceleration.y;
+  const float az = a.acceleration.z;
+  const float mag = sqrtf(ax * ax + ay * ay + az * az);
+
+  // ─ Tap: a sharp spike well above gravity (~1.8g).
+  // 300ms refractory to avoid double-fire on a single physical hit.
+  if (mag > 18.0f && now - lastGestureMs > 300) {
+    lastGesture   = "tap";
+    lastGestureMs = now;
+    handleTouchShort();   // confirms / acks permission, same as TTP223 short
+    return;
+  }
+
+  // ─ Shake: count X-axis zero-crossings over a 1s window.
+  static int8_t prevSign        = 0;
+  static uint8_t crossCount     = 0;
+  static unsigned long winStart = 0;
+  if (now - winStart > 1000) {
+    if (crossCount >= 5 && now - lastGestureMs > 600) {
+      lastGesture   = "shake";
+      lastGestureMs = now;
+      setSessionState(SS_IDLE);
+      beep(BEEP_TOUCH_OK);
+    }
+    crossCount = 0;
+    winStart   = now;
+  }
+  int8_t sign = (ax > 2.0f) ? 1 : (ax < -2.0f ? -1 : 0);
+  if (sign != 0 && prevSign != 0 && sign != prevSign) crossCount++;
+  if (sign != 0) prevSign = sign;
 }
 
 void initColours() {
@@ -451,6 +710,178 @@ void animLogoReveal() {
 }
 
 // ═════════════════════════════════════════════════════════════
+//  SESSION VIEWS (Claude Code state mirror)
+// ═════════════════════════════════════════════════════════════
+
+// Centred text helper for full-width labels (textSize=2, char w=12)
+void centredText(const String& s, int16_t y, uint16_t col, uint8_t size) {
+  tft.setTextSize(size);
+  const int16_t w = s.length() * 6 * size;
+  tft.setCursor((DISP_W - w) / 2, y);
+  tft.setTextColor(col);
+  tft.print(s);
+}
+
+void drawWorkingView(const String& tool) {
+  tft.fillScreen(C_DARKBG);
+  // top strip
+  tft.fillRect(0, 0, DISP_W, 4, C_ORANGE);
+  // small concentrating squish eyes, upper third
+  const int16_t lx = 60, rx = 150, cy = 70;
+  drawChevron(lx + 15, cy, 18, 12, 6, true,  C_WHITE);
+  drawChevron(rx + 15, cy, 18, 12, 6, false, C_WHITE);
+  // tool label
+  centredText("WORKING", 120, C_MUTED, 1);
+  String t = tool.length() ? tool : "...";
+  if (t.length() > 14) t = t.substring(0, 14);
+  centredText(t, 140, C_ORANGE, 2);
+  // bottom strip
+  tft.fillRect(0, DISP_H - 4, DISP_W, 4, C_ORANGE);
+}
+
+void drawPermissionView(const String& desc) {
+  tft.fillScreen(C_DARKBG);
+  // thick orange frame to signal "attention"
+  tft.fillRect(0, 0,          DISP_W, 8, C_ORANGE);
+  tft.fillRect(0, DISP_H - 8, DISP_W, 8, C_ORANGE);
+  tft.fillRect(0,          0, 8, DISP_H, C_ORANGE);
+  tft.fillRect(DISP_W - 8, 0, 8, DISP_H, C_ORANGE);
+  // big surprised eyes
+  const int16_t ey  = 40;
+  const int16_t lx  = 50, rx = 150;
+  const int16_t eyW = 40, eyH = 50;
+  tft.fillRect(lx, ey, eyW, eyH, C_WHITE);
+  tft.fillRect(rx, ey, eyW, eyH, C_WHITE);
+  tft.fillCircle(lx + eyW / 2, ey + eyH / 2, 6, C_BLACK);
+  tft.fillCircle(rx + eyW / 2, ey + eyH / 2, 6, C_BLACK);
+  // labels
+  centredText("PERMISSION?", 110, C_ORANGE, 2);
+  String d = desc;
+  if (d.length() > 26) d = d.substring(0, 23) + "...";
+  centredText(d, 140, C_MUTED, 1);
+  centredText("tap = OK", 168, C_GREEN, 1);
+  centredText("hold = NO", 184, C_ORANGE, 1);
+}
+
+void drawErrorView(const String& msg) {
+  tft.fillScreen(tft.color565(40, 8, 8));
+  // × eyes
+  const int16_t lcx = 70, rcx = 170, cy = 80, arm = 22;
+  for (int8_t t = -3; t <= 3; t++) {
+    tft.drawLine(lcx - arm, cy - arm + t, lcx + arm, cy + arm + t, C_WHITE);
+    tft.drawLine(lcx + arm, cy - arm + t, lcx - arm, cy + arm + t, C_WHITE);
+    tft.drawLine(rcx - arm, cy - arm + t, rcx + arm, cy + arm + t, C_WHITE);
+    tft.drawLine(rcx + arm, cy - arm + t, rcx - arm, cy + arm + t, C_WHITE);
+  }
+  centredText("ERROR", 150, C_WHITE, 3);
+  if (msg.length()) {
+    String m = msg;
+    if (m.length() > 26) m = m.substring(0, 23) + "...";
+    centredText(m, 200, C_MUTED, 1);
+  }
+}
+
+// Force the screen to redraw whatever the current state says.
+void redrawCurrentView();   // forward decl
+
+void setSessionState(SessionState s, const String& meta) {
+  sessionState        = s;
+  sessionMeta         = meta;
+  lastSessionEventMs  = millis();
+  sessionAnimPhase    = 0;
+  sessionAnimNextMs   = 0;
+  if (!autoMode) return;
+
+  switch (s) {
+    case SS_IDLE:
+      currentView = VIEW_EYES_NORMAL;
+      drawNormalEyes();
+      break;
+    case SS_THINKING:
+      currentView = VIEW_EYES_SQUISH;
+      drawSquishEyes(false);
+      beep(BEEP_THINK);
+      break;
+    case SS_WORKING:
+      currentView = VIEW_WORKING;
+      drawWorkingView(meta);
+      beep(BEEP_TOOL);
+      break;
+    case SS_PERMISSION:
+      currentView = VIEW_PERMISSION;
+      drawPermissionView(meta);
+      beep(BEEP_PERMISSION);
+      break;
+    case SS_DONE:
+      currentView = VIEW_EYES_SQUISH;
+      drawSquishEyes(false);
+      beep(BEEP_DONE);
+      break;
+    case SS_ERROR:
+      currentView = VIEW_ERROR;
+      drawErrorView(meta);
+      beep(BEEP_ERROR);
+      break;
+  }
+}
+
+// Non-blocking "breathing" for idle / thinking / permission.
+void tickSessionAnim() {
+  if (!autoMode || busy) return;
+  unsigned long now = millis();
+  if (now < sessionAnimNextMs) return;
+
+  switch (sessionState) {
+    case SS_THINKING:
+      // pulse open/closed squish every 600ms
+      sessionAnimPhase ^= 1;
+      drawSquishEyes(sessionAnimPhase);
+      sessionAnimNextMs = now + 600;
+      break;
+    case SS_IDLE:
+      // gentle side-to-side wiggle every 4s, single notch
+      sessionAnimPhase = (sessionAnimPhase + 1) % 4;
+      drawNormalEyes((sessionAnimPhase == 1) ? -6 :
+                     (sessionAnimPhase == 3) ?  6 : 0);
+      sessionAnimNextMs = now + 4000;
+      break;
+    case SS_PERMISSION:
+      // flash the orange frame
+      sessionAnimPhase ^= 1;
+      {
+        const uint16_t col = sessionAnimPhase ? C_ORANGE : C_DARKBG;
+        tft.fillRect(0, 0,          DISP_W, 8, col);
+        tft.fillRect(0, DISP_H - 8, DISP_W, 8, col);
+        tft.fillRect(0,          0, 8, DISP_H, col);
+        tft.fillRect(DISP_W - 8, 0, 8, DISP_H, col);
+      }
+      sessionAnimNextMs = now + 500;
+      break;
+    case SS_DONE:
+      // After 3s, drop back to idle
+      if (now - lastSessionEventMs > 3000) {
+        setSessionState(SS_IDLE);
+      } else {
+        sessionAnimNextMs = now + 500;
+      }
+      break;
+    default: break;
+  }
+}
+
+void redrawCurrentView() {
+  switch (currentView) {
+    case VIEW_EYES_NORMAL: drawNormalEyes(); break;
+    case VIEW_EYES_SQUISH: drawSquishEyes(); break;
+    case VIEW_CODE:        drawCodeView();   break;
+    case VIEW_DRAW:        tft.fillScreen(drawBgColor); break;
+    case VIEW_WORKING:     drawWorkingView(sessionMeta); break;
+    case VIEW_PERMISSION:  drawPermissionView(sessionMeta); break;
+    case VIEW_ERROR:       drawErrorView(sessionMeta); break;
+  }
+}
+
+// ═════════════════════════════════════════════════════════════
 //  WEB PAGE
 // ═════════════════════════════════════════════════════════════
 const char INDEX_HTML[] PROGMEM = R"rawhtml(
@@ -570,6 +1001,7 @@ canvas{width:100%;border-radius:8px;border:1.5px solid #38343a;
 <div class="sec">// controls</div>
 <div class="ctrl">
   <button class="cbtn on" id="blBtn" onclick="toggleBL()">&#9728; display on</button>
+  <button class="cbtn on" id="bzBtn" onclick="toggleBZ()">&#9835; sound on</button>
 </div>
 
 <div class="sec">// views</div>
@@ -642,6 +1074,7 @@ let activeView  = 0;
 let termOpen    = false;
 let canvasOpen  = false;
 let blOn        = true;
+let bzOn        = true;
 let isBusy      = false;
 let drawing     = false;
 let lastX = 0, lastY = 0;
@@ -670,7 +1103,7 @@ function setBusy(b) {
   });
   document.querySelectorAll('.lbtn').forEach(el => el.disabled = locked || canvasOpen);
   document.querySelectorAll('.cbtn').forEach(el => {
-    if (el.id !== 'blBtn') el.disabled = locked;
+    if (el.id !== 'blBtn' && el.id !== 'bzBtn') el.disabled = locked;
   });
 }
 
@@ -742,6 +1175,16 @@ async function toggleBL() {
   b.textContent = blOn ? '\u2600 display on' : '\u25cb display off';
   b.classList.toggle('on', blOn);
   b.classList.toggle('dim', !blOn);
+}
+
+// \u2500\u2500 Buzzer \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+async function toggleBZ() {
+  bzOn = !bzOn;
+  await req('/buzzer?on=' + (bzOn ? 1 : 0));
+  const b = document.getElementById('bzBtn');
+  b.textContent = bzOn ? '\u266b sound on' : '\u266c sound off';
+  b.classList.toggle('on', bzOn);
+  b.classList.toggle('dim', !bzOn);
 }
 
 // ── Canvas toggle ───────────────────────────────────────────────
@@ -871,6 +1314,13 @@ async function clearAll() {
       b.textContent = '\u25cb display off';
       b.classList.remove('on'); b.classList.add('dim');
     }
+    // Sync buzzer
+    if (j.buzzer === false) {
+      bzOn = false;
+      const b = document.getElementById('bzBtn');
+      b.textContent = '\u266c sound off';
+      b.classList.remove('on'); b.classList.add('dim');
+    }
   } catch(e) {}
   // Always reset bg picker to default orange on page load
   document.getElementById('bgCol').value = '#aa4818';
@@ -882,13 +1332,163 @@ async function clearAll() {
 )rawhtml";
 
 // ═════════════════════════════════════════════════════════════
+//  SETUP PAGE (served at "/" when in AP provisioning mode)
+// ═════════════════════════════════════════════════════════════
+const char SETUP_HTML[] PROGMEM = R"rawhtml(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Clawd Mochi Setup</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+body{background:#1c1c20;color:#e8e4dc;font-family:'Courier New',monospace;
+  padding:24px 16px;max-width:420px;margin:0 auto;min-height:100vh}
+h1{color:#c96a3e;font-size:18px;letter-spacing:2px;text-align:center;margin-bottom:6px}
+.sub{color:#8a8278;font-size:11px;text-align:center;letter-spacing:2px;margin-bottom:24px}
+label{display:block;color:#8a8278;font-size:11px;letter-spacing:2px;
+  font-weight:bold;margin:18px 0 6px;text-transform:uppercase}
+input{width:100%;padding:12px;background:#252428;border:1.5px solid #38343a;
+  border-radius:10px;color:#e8e4dc;font:14px 'Courier New',monospace;outline:none}
+input:focus{border-color:#c96a3e}
+button{margin-top:28px;width:100%;padding:14px;background:#c96a3e;border:none;
+  border-radius:10px;color:#fff;font:bold 13px 'Courier New',monospace;
+  cursor:pointer;letter-spacing:2px}
+button:active{transform:scale(.97)}
+.hint{color:#5a5048;font-size:10px;margin-top:24px;line-height:1.6;letter-spacing:1px}
+.ok{color:#28b878;font-size:13px;margin-top:18px;text-align:center}
+</style>
+</head>
+<body>
+<h1>&#x1F980; CLAWD MOCHI</h1>
+<div class="sub">FIRST-TIME SETUP</div>
+<form id=f action="/provision" method="POST">
+  <label>WiFi network (SSID)</label>
+  <input name=ssid required autocapitalize=off autocorrect=off spellcheck=false>
+  <label>WiFi password</label>
+  <input name=pass type=password autocapitalize=off autocorrect=off spellcheck=false>
+  <button type=submit>SAVE &amp; REBOOT</button>
+</form>
+<div class="hint">
+  After save, Mochi will reboot and try to connect to your home network.
+  The new IP address will appear on Mochi's display.
+  Open that address in your browser to use the controller.
+</div>
+<script>
+document.getElementById('f').addEventListener('submit', e => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  fetch('/provision', { method:'POST', body: new URLSearchParams(fd) })
+    .then(() => {
+      document.body.innerHTML = '<h1>&#x1F980; CLAWD MOCHI</h1>'
+        + '<div class="ok">Saved! Rebooting Mochi...</div>'
+        + '<div class="hint" style="text-align:center;margin-top:24px">'
+        + 'Watch the display for the new IP address.</div>';
+    });
+});
+</script>
+</body>
+</html>
+)rawhtml";
+
+// ═════════════════════════════════════════════════════════════
+//  DISPLAY HELPERS (WiFi info screens)
+// ═════════════════════════════════════════════════════════════
+
+void showApInfoScreen() {
+  tft.fillScreen(C_DARKBG);
+  tft.fillRect(0, 0, DISP_W, 4, C_ORANGE);
+  tft.setTextColor(C_WHITE);  tft.setTextSize(2);
+  tft.setCursor(12, 16);  tft.print("SETUP MODE");
+  tft.setTextColor(C_MUTED);  tft.setTextSize(1);
+  tft.setCursor(12, 44);  tft.print("1. join WiFi:");
+  tft.setTextColor(C_ORANGE); tft.setTextSize(2);
+  tft.setCursor(12, 58);  tft.print(AP_SSID);
+  tft.setTextColor(C_MUTED);  tft.setTextSize(1);
+  tft.setCursor(12, 84);  tft.print("password: "); tft.print(AP_PASS);
+  tft.setCursor(12, 104); tft.print("2. browse to:");
+  tft.setTextColor(C_ORANGE); tft.setTextSize(2);
+  tft.setCursor(12, 118); tft.print("192.168.4.1");
+  tft.setTextColor(C_MUTED);  tft.setTextSize(1);
+  tft.setCursor(12, 144); tft.print("3. enter home WiFi");
+}
+
+void showConnectingScreen(const String& ssid) {
+  tft.fillScreen(C_DARKBG);
+  tft.fillRect(0, 0, DISP_W, 4, C_ORANGE);
+  tft.setTextColor(C_WHITE);  tft.setTextSize(2);
+  tft.setCursor(12, 16);  tft.print("Connecting...");
+  tft.setTextColor(C_MUTED);  tft.setTextSize(1);
+  tft.setCursor(12, 50);  tft.print("ssid: "); tft.print(ssid);
+}
+
+void showStaInfoScreen(IPAddress ip) {
+  staIpStr = ip.toString();
+  tft.fillScreen(C_DARKBG);
+  tft.fillRect(0, 0, DISP_W, 4, C_GREEN);
+  tft.setTextColor(C_WHITE);  tft.setTextSize(2);
+  tft.setCursor(12, 16);  tft.print("Online!");
+  tft.setTextColor(C_MUTED);  tft.setTextSize(1);
+  tft.setCursor(12, 50);  tft.print("Open browser:");
+  tft.setTextColor(C_ORANGE); tft.setTextSize(2);
+  tft.setCursor(12, 66);  tft.print(staIpStr);
+  tft.setTextColor(C_MUTED);  tft.setTextSize(1);
+  tft.setCursor(12, 100); tft.print("ssid: "); tft.print(staSsid);
+  tft.setCursor(12, 120); tft.print("waiting for session...");
+}
+
+// ═════════════════════════════════════════════════════════════
 //  WEB ROUTES
 // ═════════════════════════════════════════════════════════════
 
 void routeRoot() {
   server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
   server.sendHeader("Pragma", "no-cache");
-  server.send_P(200, "text/html", INDEX_HTML);
+  if (apMode) server.send_P(200, "text/html", SETUP_HTML);
+  else        server.send_P(200, "text/html", INDEX_HTML);
+}
+
+void routeSetup() {
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  server.send_P(200, "text/html", SETUP_HTML);
+}
+
+void routeProvision() {
+  if (!server.hasArg("ssid") || server.arg("ssid").isEmpty()) {
+    server.send(400, "text/plain", "missing ssid"); return;
+  }
+  cfgSave(server.arg("ssid"), server.arg("pass"));
+  server.send(200, "application/json", "{\"ok\":1}");
+  delay(800);
+  ESP.restart();
+}
+
+void routeFactoryReset() {
+  cfgClear();
+  server.send(200, "application/json", "{\"ok\":1}");
+  delay(500);
+  ESP.restart();
+}
+
+// Map event type strings (from Mac bridge) → SessionState
+void routeEvent() {
+  const String t    = server.arg("type");
+  const String meta = server.arg("meta");
+  if      (t == "prompt")     setSessionState(SS_THINKING,   meta);
+  else if (t == "tool_pre")   setSessionState(SS_WORKING,    meta);
+  else if (t == "tool_post")  setSessionState(SS_THINKING,   meta);
+  else if (t == "permission") setSessionState(SS_PERMISSION, meta);
+  else if (t == "stop")       setSessionState(SS_DONE,       meta);
+  else if (t == "error")      setSessionState(SS_ERROR,      meta);
+  else if (t == "idle")       setSessionState(SS_IDLE,       meta);
+  else { server.send(400, "application/json", "{\"e\":\"unknown type\"}"); return; }
+  server.send(200, "application/json", "{\"ok\":1}");
+}
+
+void routeAuto() {
+  if (server.hasArg("on")) autoMode = (server.arg("on") == "1");
+  server.send(200, "application/json", "{\"ok\":1}");
 }
 
 void routeCmd() {
@@ -898,20 +1498,33 @@ void routeCmd() {
   const char c = server.arg("k")[0];
 
   if (termMode) {
-    if (c == 'q') { termMode = false; drawCodeView(); }
+    if (c == 'q') { termMode = false; drawCodeView(); beep(BEEP_VIEW); }
     server.send(200, "application/json", "{\"ok\":1}"); return;
   }
 
   server.send(200, "application/json", "{\"ok\":1}");
+  beep(BEEP_VIEW);
   switch (c) {
-    case 'w': currentView = VIEW_EYES_NORMAL; animNormalEyes(); break;
-    case 's': currentView = VIEW_EYES_SQUISH; animSquishEyes(); break;
+    // Play the blocking demo animation, then settle into the matching
+    // ambient session state so the tick keeps the mood going.
+    case 'w':
+      currentView = VIEW_EYES_NORMAL;
+      animNormalEyes();
+      setSessionState(SS_IDLE);
+      break;
+    case 's':
+      currentView = VIEW_EYES_SQUISH;
+      animSquishEyes();
+      setSessionState(SS_THINKING);
+      break;
     case 'd':
       currentView = VIEW_CODE; drawCodeView();
-      termMode = true; termClear(); termFullRedraw(); break;
+      termMode = true; termClear(); termFullRedraw();
+      break;
     case 'a':
-      currentView = VIEW_EYES_NORMAL;
+      // One-shot demo — does not change sessionState.
       animLogoReveal();
+      redrawCurrentView();
       break;
   }
 }
@@ -919,7 +1532,7 @@ void routeCmd() {
 void routeChar() {
   if (!termMode) { server.send(200, "application/json", "{\"ok\":1}"); return; }
   const String val = server.arg("c");
-  if (val.length() > 0) termAddChar(val[0]);
+  if (val.length() > 0) { termAddChar(val[0]); beep(BEEP_TYPE); }
   server.send(200, "application/json", "{\"ok\":1}");
 }
 
@@ -934,12 +1547,7 @@ void routeRedraw() {
     animBgColor = hexToRgb565(server.arg("bg"));
     drawBgColor = animBgColor;
   }
-  switch (currentView) {
-    case VIEW_EYES_NORMAL: drawNormalEyes(); break;
-    case VIEW_EYES_SQUISH: drawSquishEyes(); break;
-    case VIEW_CODE:        drawCodeView();   break;
-    case VIEW_DRAW:        tft.fillScreen(drawBgColor); break;
-  }
+  redrawCurrentView();
   server.send(200, "application/json", "{\"ok\":1}");
 }
 
@@ -996,6 +1604,12 @@ void routeBacklight() {
   server.send(200, "application/json", "{\"ok\":1}");
 }
 
+void routeBuzzer() {
+  buzzerMuted = !(server.hasArg("on") && server.arg("on") == "1");
+  if (!buzzerMuted) beep(BEEP_VIEW);   // audible confirmation on unmute
+  server.send(200, "application/json", "{\"ok\":1}");
+}
+
 // Convert RGB565 back to #RRGGBB for state endpoint
 String rgb565ToHex(uint16_t c) {
   uint8_t r = ((c >> 11) & 0x1F) << 3;
@@ -1011,7 +1625,18 @@ void routeState() {
   j += ",\"busy\":";   j += busy        ? "true" : "false";
   j += ",\"term\":";   j += termMode    ? "true" : "false";
   j += ",\"bl\":";     j += backlightOn ? "true" : "false";
+  j += ",\"buzzer\":"; j += buzzerMuted ? "false" : "true";
   j += ",\"speed\":";  j += animSpeed;
+  j += ",\"ap\":";     j += apMode      ? "true" : "false";
+  j += ",\"ip\":\"";   j += staIpStr;   j += "\"";
+  j += ",\"ssid\":\""; j += staSsid;    j += "\"";
+  j += ",\"sess\":";   j += (int)sessionState;
+  j += ",\"meta\":\""; j += sessionMeta; j += "\"";
+  j += ",\"auto\":";   j += autoMode    ? "true" : "false";
+  j += ",\"touch\":\"";    j += touchLastEvent;       j += "\"";
+  j += ",\"touchTs\":";    j += touchLastEventMs;
+  j += ",\"mpu\":";        j += mpuPresent ? "true" : "false";
+  j += ",\"gesture\":\""; j += lastGesture;          j += "\"";
   j += "}";
   server.send(200, "application/json", j);
 }
@@ -1028,6 +1653,20 @@ void setup() {
   pinMode(TFT_BLK, OUTPUT);
   setBacklight(true);
 
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(TOUCH_PIN, INPUT);
+  pinMode(BOOT_PIN, INPUT_PULLUP);
+
+  // I2C for MPU6050 (free because USB CDC On Boot moves Serial off GPIO 20/21)
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000);
+  mpuPresent = mpu.begin(0x68, &Wire);
+  if (mpuPresent) {
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  }
+
   SPI.begin(8, -1, 10, TFT_CS);   // SCK=8, MOSI=10
   tft.init(240, 240);
   tft.setSPISpeed(40000000);
@@ -1043,24 +1682,51 @@ void setup() {
 
   // ── Logo shown once at startup ─────────────────────────────
   animLogoReveal();
+  beep(BEEP_BOOT);
 
-  // ── Start WiFi ─────────────────────────────────────────────
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASS);
+  // ── Start WiFi: STA-first, AP fallback ─────────────────────
+  cfgLoad();
 
-  // ── WiFi info screen (stays until first web request) ───────
-  tft.fillScreen(C_DARKBG);
-  tft.fillRect(0, 0, DISP_W, 4, C_ORANGE);
-  tft.setTextColor(C_WHITE);  tft.setTextSize(2);
-  tft.setCursor(12, 16);  tft.print("WiFi: ClaWD-Mochi");
-  tft.setTextColor(C_MUTED);  tft.setTextSize(1);
-  tft.setCursor(12, 44);  tft.print("password: clawd1234");
-  tft.setTextColor(C_WHITE);  tft.setTextSize(2);
-  tft.setCursor(12, 68);  tft.print("Open browser:");
-  tft.setTextColor(C_ORANGE); tft.setTextSize(2);
-  tft.setCursor(12, 94);  tft.print("192.168.4.1");
-  tft.setTextColor(C_MUTED);  tft.setTextSize(1);
-  tft.setCursor(12, 124); tft.print("press any button to start");
+  if (staSsid.length() == 0) {
+    // No saved network — provisioning AP
+    apMode = true;
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASS);
+    showApInfoScreen();
+  } else {
+    // Try to connect to saved network
+    apMode = false;
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(staSsid.c_str(), staPass.c_str());
+    showConnectingScreen(staSsid);
+
+    unsigned long start = millis();
+    uint8_t dots = 0;
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+      delay(250);
+      // animate progress dots
+      tft.setTextColor(C_ORANGE); tft.setTextSize(2);
+      tft.setCursor(12 + dots * 12, 86);
+      tft.print(".");
+      dots = (dots + 1) % 12;
+      if (dots == 0) {
+        tft.fillRect(12, 80, DISP_W - 24, 22, C_DARKBG);
+      }
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      showStaInfoScreen(WiFi.localIP());
+      beep(BEEP_DONE);
+    } else {
+      // STA failed → fall back to AP for re-provisioning
+      apMode = true;
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_AP);
+      WiFi.softAP(AP_SSID, AP_PASS);
+      showApInfoScreen();
+      beep(BEEP_ERROR);
+    }
+  }
 
   // ── Register routes ────────────────────────────────────────
   server.on("/",            HTTP_GET, routeRoot);
@@ -1072,6 +1738,13 @@ void setup() {
   server.on("/draw/clear",  HTTP_GET, routeDrawClear);
   server.on("/draw/stroke", HTTP_GET, routeDrawStroke);
   server.on("/backlight",   HTTP_GET, routeBacklight);
+  server.on("/buzzer",      HTTP_GET, routeBuzzer);
+  server.on("/setup",       HTTP_GET, routeSetup);
+  server.on("/provision",   HTTP_POST, routeProvision);
+  server.on("/factoryreset", HTTP_POST, routeFactoryReset);
+  server.on("/event",       HTTP_GET, routeEvent);
+  server.on("/event",       HTTP_POST, routeEvent);
+  server.on("/auto",        HTTP_GET, routeAuto);
   server.on("/state",       HTTP_GET, routeState);
   server.onNotFound(routeNotFound);
   server.begin();
@@ -1084,4 +1757,10 @@ void setup() {
 //  LOOP
 // ═════════════════════════════════════════════════════════════
 
-void loop() { server.handleClient(); }
+void loop() {
+  server.handleClient();
+  tickTouch();
+  tickBoot();
+  tickMpu();
+  tickSessionAnim();
+}
